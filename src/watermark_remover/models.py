@@ -47,6 +47,9 @@ class OverlayCandidate:
     mask: np.ndarray
     detector_score: float
     persistence: float
+    source: str = "temporal"
+    group_id: str | None = None
+    repeat_score: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mask.shape != (self.rect.height, self.rect.width):
