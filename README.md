@@ -22,8 +22,9 @@ The automatic pipeline is:
 
 ```
 sample frames
-  -> persistent overlay detection
-  -> candidate mask
+  -> spatial repetition detector (for tiled watermarks)
+     OR temporal persistence detector (for a single fixed overlay)
+  -> candidate mask/group
   -> local background reconstruction
   -> alpha/template estimation
   -> fit validation
@@ -31,18 +32,22 @@ sample frames
   -> FFmpeg encode + original audio remux
 ```
 
-Known-provider templates can be added later as a cache/optimization, but they are not part of the removal algorithm.
+For repeated/tiled watermarks, the detector uses edge-map autocorrelation to discover the visual lattice. This is generic: it does not need to know that a watermark came from a particular provider. Because REC indicators, timers, and battery icons are usually unique rather than spatially repeated, they are excluded from the repeated-overlay path.
+
+Known-provider templates can still be added later as a cache/optimization, but they are not part of the removal algorithm.
 
 ## Current MVP scope
 
 Works best when the watermark:
 
-- stays at a fixed screen position;
+- stays at a fixed screen position or repeats on a fixed spatial lattice;
 - is visible across most of the video;
 - is partially transparent;
 - sits over content that changes enough across sampled frames.
 
 Automatic estimation is fundamentally ambiguous on a single frame. Very short videos, nearly static backgrounds, moving watermarks, adaptive-color watermarks, and fully opaque overlays can fall back to inpainting.
+
+The current tiled-watermark path is intentionally conservative: it only activates when at least three similarly sized repeated components form a strong spatial pattern. Otherwise the engine falls back to the single-overlay temporal detector.
 
 ## Install
 
@@ -65,7 +70,7 @@ Analyze a video without writing output:
 watermark-remover analyze input.mp4 --report report.json --debug-dir debug
 ```
 
-Remove an automatically detected fixed overlay:
+Remove an automatically detected overlay:
 
 ```bash
 watermark-remover remove input.mp4 output.mp4
@@ -94,10 +99,14 @@ from watermark_remover.engine import WatermarkRemover
 
 engine = WatermarkRemover(sample_count=18)
 analysis = engine.analyze("input.mp4")
+
 print(analysis.report)
+print(len(analysis.models))
 
 engine.remove("input.mp4", "output.mp4", analysis=analysis)
 ```
+
+`analysis.model` remains available as a compatibility shortcut for the first selected model, while `analysis.models` contains the whole repeated group when a tiled watermark is detected.
 
 ## Design notes
 
