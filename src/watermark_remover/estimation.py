@@ -117,8 +117,11 @@ def estimate_overlay_model(
         method = "inpaint"
 
     diagnostics = {
+        "source": candidate.source,
+        "group_id": candidate.group_id,
         "detector_score": candidate.detector_score,
         "persistence": candidate.persistence,
+        "repeat_score": candidate.repeat_score,
         "transparent_fit_ratio": transparent_ratio,
         "median_transparent_alpha": median_alpha,
         "median_transparent_fit_error": median_error,
