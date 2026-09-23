@@ -8,7 +8,11 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .detection import candidate_from_full_frame_mask, detect_static_overlay_candidates
+from .detection import (
+    candidate_from_full_frame_mask,
+    detect_repeated_overlay_candidates,
+    detect_static_overlay_candidates,
+)
 from .estimation import estimate_overlay_model
 from .models import OverlayModel
 from .removal import remove_overlay_from_frame
@@ -17,8 +21,15 @@ from .video import encode_processed_video, sample_video_frames
 
 @dataclass
 class AnalysisResult:
-    model: OverlayModel
+    models: list[OverlayModel]
     report: dict[str, Any]
+
+    @property
+    def model(self) -> OverlayModel:
+        """Backward-compatible access to the first selected model."""
+        if not self.models:
+            raise RuntimeError("analysis contains no overlay model")
+        return self.models[0]
 
 
 class WatermarkRemover:
@@ -47,36 +58,70 @@ class WatermarkRemover:
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is None:
                 raise RuntimeError(f"cannot read mask: {mask_path}")
-            candidates = [candidate_from_full_frame_mask(mask, (frame_height, frame_width))]
+            candidates = [
+                candidate_from_full_frame_mask(
+                    mask,
+                    (frame_height, frame_width),
+                )
+            ]
+            selection_mode = "manual"
         else:
-            candidates = detect_static_overlay_candidates(
+            repeated = detect_repeated_overlay_candidates(
                 frames,
-                max_candidates=self.max_candidates,
+                max_candidates=max(self.max_candidates, 16),
             )
+            if len(repeated) >= 3:
+                # A repeated lattice is much more selective than generic persistence:
+                # keep the complete group so a tiled watermark is removed everywhere,
+                # while unique HUD elements such as REC/timers are left alone.
+                candidates = repeated
+                selection_mode = "spatial-repeat"
+            else:
+                candidates = detect_static_overlay_candidates(
+                    frames,
+                    max_candidates=self.max_candidates,
+                )
+                selection_mode = "temporal-best"
 
         if not candidates:
             raise RuntimeError(
-                "no persistent overlay candidate found; provide --mask for a manual region"
+                "no overlay candidate found; provide --mask for a manual region"
             )
 
-        models = [estimate_overlay_model(frames, candidate) for candidate in candidates]
-        models.sort(key=lambda item: item.confidence, reverse=True)
-        model = models[0]
+        candidate_models = [
+            estimate_overlay_model(frames, candidate)
+            for candidate in candidates
+        ]
+
+        if selection_mode == "spatial-repeat":
+            # Every component belongs to the same repeated group.
+            models = candidate_models
+        else:
+            candidate_models.sort(
+                key=lambda item: item.confidence,
+                reverse=True,
+            )
+            models = [candidate_models[0]]
 
         report: dict[str, Any] = {
             "input": str(input_path),
-            "frame": {"width": frame_width, "height": frame_height},
+            "frame": {
+                "width": frame_width,
+                "height": frame_height,
+            },
             "sample_count": len(frames),
+            "selection_mode": selection_mode,
             "candidate_count": len(candidates),
-            "selected": model.report(),
-            "candidates": [candidate_model.report() for candidate_model in models],
+            "selected_count": len(models),
+            "selected": [model.report() for model in models],
+            "candidates": [model.report() for model in candidate_models],
         }
 
         if debug_dir is not None:
-            self._write_debug_files(model, Path(debug_dir))
+            self._write_debug_files(models, Path(debug_dir))
             report["debug_dir"] = str(debug_dir)
 
-        return AnalysisResult(model=model, report=report)
+        return AnalysisResult(models=models, report=report)
 
     def remove(
         self,
@@ -96,14 +141,24 @@ class WatermarkRemover:
                 debug_dir=debug_dir,
             )
 
-        allow_deblend = analysis.model.confidence >= self.min_confidence
+        deblend_flags = [
+            model.confidence >= self.min_confidence
+            for model in analysis.models
+        ]
 
         def process(frame: np.ndarray) -> np.ndarray:
-            return remove_overlay_from_frame(
-                frame,
-                analysis.model,
-                allow_deblend=allow_deblend,
-            )
+            output = frame
+            for model, allow_deblend in zip(
+                analysis.models,
+                deblend_flags,
+                strict=True,
+            ):
+                output = remove_overlay_from_frame(
+                    output,
+                    model,
+                    allow_deblend=allow_deblend,
+                )
+            return output
 
         encode_processed_video(
             input_path,
@@ -114,30 +169,52 @@ class WatermarkRemover:
         )
 
         analysis.report["output"] = str(output_path)
-        analysis.report["deblend_enabled"] = allow_deblend
-        if not allow_deblend:
-            analysis.report["fallback_reason"] = (
-                f"model confidence {analysis.model.confidence:.3f} "
-                f"is below threshold {self.min_confidence:.3f}"
-            )
+        analysis.report["deblend_enabled"] = deblend_flags
+        analysis.report["deblend_model_count"] = int(sum(deblend_flags))
+        analysis.report["inpaint_only_model_count"] = int(
+            len(deblend_flags) - sum(deblend_flags)
+        )
         return analysis
 
     @staticmethod
-    def save_report(report: dict[str, Any], path: str | Path) -> None:
-        Path(path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    def save_report(
+        report: dict[str, Any],
+        path: str | Path,
+    ) -> None:
+        Path(path).write_text(
+            json.dumps(report, indent=2),
+            encoding="utf-8",
+        )
 
     @staticmethod
-    def _write_debug_files(model: OverlayModel, directory: Path) -> None:
+    def _write_debug_files(
+        models: list[OverlayModel],
+        directory: Path,
+    ) -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
-        cv2.imwrite(str(directory / "mask.png"), model.mask.astype(np.uint8) * 255)
-        cv2.imwrite(
-            str(directory / "alpha.png"),
-            np.clip(model.alpha * 255.0, 0, 255).astype(np.uint8),
-        )
-        cv2.imwrite(
-            str(directory / "overlay-rgb.png"),
-            np.clip(model.rgb * 255.0, 0, 255).astype(np.uint8),
-        )
-        error_preview = np.clip(model.fit_error / 0.08 * 255.0, 0, 255).astype(np.uint8)
-        cv2.imwrite(str(directory / "fit-error.png"), error_preview)
+        for index, model in enumerate(models):
+            model_dir = directory / f"model-{index:02d}"
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+            cv2.imwrite(
+                str(model_dir / "mask.png"),
+                model.mask.astype(np.uint8) * 255,
+            )
+            cv2.imwrite(
+                str(model_dir / "alpha.png"),
+                np.clip(model.alpha * 255.0, 0, 255).astype(np.uint8),
+            )
+            cv2.imwrite(
+                str(model_dir / "overlay-rgb.png"),
+                np.clip(model.rgb * 255.0, 0, 255).astype(np.uint8),
+            )
+            error_preview = np.clip(
+                model.fit_error / 0.08 * 255.0,
+                0,
+                255,
+            ).astype(np.uint8)
+            cv2.imwrite(
+                str(model_dir / "fit-error.png"),
+                error_preview,
+            )
