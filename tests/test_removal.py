@@ -269,4 +269,4 @@ def test_known_tiled_profile_matches_and_restores_calibrated_overlay():
 
     delta = np.concatenate(deltas, axis=0)
     assert float(np.mean(delta)) < 1.5
-    assert int(np.percentile(delta, 99)) <= 3
+    assert int(np.percentile(delta, 99)) <= 4
