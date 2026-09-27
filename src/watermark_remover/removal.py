@@ -13,8 +13,18 @@ def remove_overlay_from_frame(
     allow_deblend: bool = True,
     max_deblend_alpha: float = 0.88,
     max_fit_error: float = 0.05,
+    fallback_mode: str = "keep",
     inpaint_radius: float = 3.0,
 ) -> np.ndarray:
+    """
+    Remove only pixels that have a validated reverse-alpha model.
+
+    Safety rule: uncertain pixels are preserved by default. Inpainting is opt-in
+    because a broad/incorrect mask can destroy faces, text, and fine texture.
+    """
+    if fallback_mode not in {"keep", "inpaint"}:
+        raise ValueError("fallback_mode must be 'keep' or 'inpaint'")
+
     rect = model.rect
     output = frame.copy()
     roi = output[rect.y : rect.y2, rect.x : rect.x2].copy()
@@ -39,10 +49,13 @@ def remove_overlay_from_frame(
         roi_f = np.where(deblend3, clean, roi_f)
         roi = np.round(roi_f * 255.0).astype(np.uint8)
 
-    fallback = active & ~deblend
-    if np.any(fallback):
-        mask8 = fallback.astype(np.uint8) * 255
-        roi = cv2.inpaint(roi, mask8, inpaint_radius, cv2.INPAINT_TELEA)
+    # Never mutate unresolved candidate pixels unless the caller explicitly opts
+    # into destructive inpainting.
+    if fallback_mode == "inpaint":
+        fallback = active & ~deblend
+        if np.any(fallback):
+            mask8 = fallback.astype(np.uint8) * 255
+            roi = cv2.inpaint(roi, mask8, inpaint_radius, cv2.INPAINT_TELEA)
 
     output[rect.y : rect.y2, rect.x : rect.x2] = roi
     return output
