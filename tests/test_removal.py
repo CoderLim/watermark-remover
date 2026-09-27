@@ -3,8 +3,7 @@ import numpy as np
 
 from watermark_remover.detection import detect_repeated_overlay_candidates
 from watermark_remover.estimation import consolidate_repeated_overlay_models
-from watermark_remover.models import OverlayModel, Rect
-from watermark_remover.removal import remove_overlay_from_frame
+from watermark_remover.known_profiles import (\n    detect_known_tiled_profile,\n    get_known_profile_alpha,\n)\nfrom watermark_remover.models import OverlayModel, Rect\nfrom watermark_remover.removal import remove_overlay_from_frame
 
 
 def test_reverse_alpha_recovers_synthetic_background():
@@ -195,3 +194,74 @@ def test_detects_repeated_overlay_as_one_generic_group():
     assert len(candidates) >= 8
     assert {candidate.source for candidate in candidates} == {"spatial-repeat"}
     assert {candidate.group_id for candidate in candidates} == {"repeat-0"}
+
+
+
+def test_known_tiled_profile_matches_and_restores_calibrated_overlay():
+    height, width = 1080, 1920
+    yy, xx = np.mgrid[0:height, 0:width]
+
+    # Smooth, non-repeating scene so the only strong 420px lattice is the overlay.
+    background = np.zeros((height, width, 3), dtype=np.uint8)
+    background[..., 0] = np.clip(35 + xx * 0.018 + yy * 0.006, 0, 150)
+    background[..., 1] = np.clip(45 + xx * 0.012 + yy * 0.010, 0, 150)
+    background[..., 2] = np.clip(55 + xx * 0.008 + yy * 0.014, 0, 150)
+
+    alpha = get_known_profile_alpha("heygen-tiled-v1")
+    watermarked = background.astype(np.float32) / 255.0
+
+    expected_positions = []
+    for y in (241, 661):
+        for x in (247, 667, 1087, 1507):
+            expected_positions.append((x, y))
+            roi = watermarked[
+                y : y + alpha.shape[0],
+                x : x + alpha.shape[1],
+            ]
+            a = alpha[..., None]
+            roi[:] = a + (1.0 - a) * roi
+
+    watermarked_u8 = np.round(watermarked * 255.0).astype(np.uint8)
+    match = detect_known_tiled_profile(watermarked_u8)
+
+    assert match is not None
+    assert match.profile_id == "heygen-tiled-v1"
+    assert len(match.positions) == 8
+    assert match.aggregate_score >= 0.35
+
+    actual_positions = sorted((rect.x, rect.y) for rect in match.positions)
+    expected_positions = sorted(expected_positions)
+    for (actual_x, actual_y), (expected_x, expected_y) in zip(
+        actual_positions,
+        expected_positions,
+        strict=True,
+    ):
+        assert abs(actual_x - expected_x) <= 2
+        assert abs(actual_y - expected_y) <= 2
+
+    restored = watermarked_u8.copy()
+    for model in match.to_models():
+        restored = remove_overlay_from_frame(restored, model)
+
+    active = alpha > 0
+    deltas = []
+    for y in (241, 661):
+        for x in (247, 667, 1087, 1507):
+            clean_roi = background[
+                y : y + alpha.shape[0],
+                x : x + alpha.shape[1],
+            ]
+            restored_roi = restored[
+                y : y + alpha.shape[0],
+                x : x + alpha.shape[1],
+            ]
+            deltas.append(
+                np.abs(
+                    restored_roi[active].astype(np.int16)
+                    - clean_roi[active].astype(np.int16)
+                )
+            )
+
+    delta = np.concatenate(deltas, axis=0)
+    assert float(np.mean(delta)) < 1.5
+    assert int(np.percentile(delta, 99)) <= 3
