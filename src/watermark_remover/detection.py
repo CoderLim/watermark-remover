@@ -348,9 +348,11 @@ def detect_repeated_overlay_candidates(
             rect.y : rect.y2,
             rect.x : rect.x2,
         ].astype(np.uint8)
+        # Keep repeated-overlay masks tight. Wide dilation previously turned thin
+        # watermark strokes into broad regions that could touch faces/background text.
         local_mask = cv2.dilate(
             local_mask,
-            np.ones((5, 5), np.uint8),
+            np.ones((3, 3), np.uint8),
             iterations=1,
         )
 
