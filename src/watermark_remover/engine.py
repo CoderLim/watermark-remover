@@ -13,7 +13,10 @@ from .detection import (
     detect_repeated_overlay_candidates,
     detect_static_overlay_candidates,
 )
-from .estimation import estimate_overlay_model
+from .estimation import (
+    estimate_overlay_model,
+    estimate_repeated_overlay_models,
+)
 from .models import OverlayModel
 from .removal import remove_overlay_from_frame
 from .video import encode_processed_video, sample_video_frames
@@ -71,9 +74,6 @@ class WatermarkRemover:
                 max_candidates=max(self.max_candidates, 16),
             )
             if len(repeated) >= 3:
-                # A repeated lattice is much more selective than generic persistence:
-                # keep the complete group so a tiled watermark is removed everywhere,
-                # while unique HUD elements such as REC/timers are left alone.
                 candidates = repeated
                 selection_mode = "spatial-repeat"
             else:
@@ -88,15 +88,20 @@ class WatermarkRemover:
                 "no overlay candidate found; provide --mask for a manual region"
             )
 
-        candidate_models = [
-            estimate_overlay_model(frames, candidate)
-            for candidate in candidates
-        ]
-
         if selection_mode == "spatial-repeat":
-            # Every component belongs to the same repeated group.
+            # Repeated copies are independent observations of the same visual motif.
+            # Joint consensus is intentionally conservative: unsupported pixels are
+            # removed from the active mask instead of being inpainted.
+            candidate_models = estimate_repeated_overlay_models(
+                frames,
+                candidates,
+            )
             models = candidate_models
         else:
+            candidate_models = [
+                estimate_overlay_model(frames, candidate)
+                for candidate in candidates
+            ]
             candidate_models.sort(
                 key=lambda item: item.confidence,
                 reverse=True,
@@ -115,6 +120,7 @@ class WatermarkRemover:
             "selected_count": len(models),
             "selected": [model.report() for model in models],
             "candidates": [model.report() for model in candidate_models],
+            "safety_policy": "keep-original-on-uncertainty",
         }
 
         if debug_dir is not None:
@@ -133,6 +139,7 @@ class WatermarkRemover:
         debug_dir: str | Path | None = None,
         crf: int = 18,
         preset: str = "medium",
+        fallback_mode: str = "keep",
     ) -> AnalysisResult:
         if analysis is None:
             analysis = self.analyze(
@@ -143,6 +150,7 @@ class WatermarkRemover:
 
         deblend_flags = [
             model.confidence >= self.min_confidence
+            and bool(np.any(model.mask))
             for model in analysis.models
         ]
 
@@ -157,6 +165,7 @@ class WatermarkRemover:
                     output,
                     model,
                     allow_deblend=allow_deblend,
+                    fallback_mode=fallback_mode,
                 )
             return output
 
@@ -169,9 +178,10 @@ class WatermarkRemover:
         )
 
         analysis.report["output"] = str(output_path)
+        analysis.report["fallback_mode"] = fallback_mode
         analysis.report["deblend_enabled"] = deblend_flags
         analysis.report["deblend_model_count"] = int(sum(deblend_flags))
-        analysis.report["inpaint_only_model_count"] = int(
+        analysis.report["deblend_disabled_model_count"] = int(
             len(deblend_flags) - sum(deblend_flags)
         )
         return analysis
