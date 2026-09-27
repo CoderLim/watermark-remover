@@ -8,11 +8,6 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .detection import (
-    _autocorrelation_peaks,
-    _choose_lattice_vectors,
-    _repeat_edge_map,
-)
 from .models import OverlayModel, Rect
 from .profile_data import HEYGEN_TILED_ALPHA_ZLIB_BASE64
 
@@ -21,11 +16,13 @@ from .profile_data import HEYGEN_TILED_ALPHA_ZLIB_BASE64
 class KnownTiledProfile:
     id: str
     alpha: np.ndarray
+    reference_frame_width: float
+    reference_frame_height: float
     reference_step_x: float
     reference_step_y: float
-    min_aggregate_score: float = 0.35
-    min_median_tile_score: float = 0.28
-    min_tile_score: float = 0.15
+    min_aggregate_score: float = 0.30
+    min_median_tile_score: float = 0.24
+    min_tile_score: float = 0.12
     min_strong_tiles: int = 3
     min_tiles: int = 3
 
@@ -106,6 +103,8 @@ KNOWN_TILED_PROFILES: tuple[KnownTiledProfile, ...] = (
     KnownTiledProfile(
         id="heygen-tiled-v1",
         alpha=_HEYGEN_ALPHA,
+        reference_frame_width=1920.0,
+        reference_frame_height=1080.0,
         reference_step_x=420.0,
         reference_step_y=420.0,
     ),
@@ -116,50 +115,6 @@ def _gradient_magnitude(gray: np.ndarray) -> np.ndarray:
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     return cv2.magnitude(gx, gy)
-
-
-def _axis_aligned_steps(
-    frame: np.ndarray,
-) -> tuple[float, float] | None:
-    edges, analysis_scale = _repeat_edge_map(frame)
-    peaks = _autocorrelation_peaks(edges)
-    lattice = _choose_lattice_vectors(peaks)
-
-    if len(lattice) < 2:
-        return None
-
-    full = [
-        (
-            score,
-            float(dx) / analysis_scale,
-            float(dy) / analysis_scale,
-        )
-        for score, dx, dy in lattice
-    ]
-
-    horizontal = max(
-        full,
-        key=lambda item: abs(item[1]) - abs(item[2]),
-    )
-    vertical = max(
-        full,
-        key=lambda item: abs(item[2]) - abs(item[1]),
-    )
-
-    hx, hy = horizontal[1], horizontal[2]
-    vx, vy = vertical[1], vertical[2]
-
-    if abs(hx) < 1 or abs(vy) < 1:
-        return None
-
-    # The calibrated tiled profile assumes an axis-aligned screen-space grid.
-    # If the repetition lattice is skewed/rotated, leave it to the generic path.
-    if abs(hy) > abs(hx) * 0.12:
-        return None
-    if abs(vx) > abs(vy) * 0.12:
-        return None
-
-    return abs(hx), abs(vy)
 
 
 def _aggregate_grid_score(
@@ -214,39 +169,31 @@ def _resize_alpha(
         (width, height),
         interpolation=interpolation,
     ).astype(np.float32)
-    # Quantized profile noise below one byte should not activate removal.
     resized[resized < (1.5 / 255.0)] = 0.0
     return resized
 
 
-def _match_profile(
+def _match_profile_at_scale(
     frame: np.ndarray,
     profile: KnownTiledProfile,
+    *,
+    scale: float,
 ) -> KnownProfileMatch | None:
-    steps = _axis_aligned_steps(frame)
-    if steps is None:
-        return None
-
-    step_x, step_y = steps
-    scale = float(
-        np.median(
-            [
-                step_x / profile.reference_step_x,
-                step_y / profile.reference_step_y,
-            ]
-        )
-    )
-
     if not 0.45 <= scale <= 2.5:
         return None
 
     alpha_full = _resize_alpha(profile.alpha, scale=scale)
+    step_x = profile.reference_step_x * scale
+    step_y = profile.reference_step_y * scale
 
     frame_height, frame_width = frame.shape[:2]
-    match_scale = min(1.0, 1920.0 / max(1, frame_width))
 
+    # Matching at <=1920px width keeps the fast path bounded on 4K inputs while
+    # preserving full resolution for the common 1080p case.
+    match_scale = min(1.0, 1920.0 / max(1, frame_width))
     match_width = max(32, int(round(frame_width * match_scale)))
     match_height = max(32, int(round(frame_height * match_scale)))
+
     frame_match = cv2.resize(
         frame,
         (match_width, match_height),
@@ -378,15 +325,53 @@ def _match_profile(
     )
 
 
+def _profile_scale_candidates(
+    frame: np.ndarray,
+    profile: KnownTiledProfile,
+) -> list[float]:
+    frame_height, frame_width = frame.shape[:2]
+    base = float(
+        np.median(
+            [
+                frame_width / profile.reference_frame_width,
+                frame_height / profile.reference_frame_height,
+            ]
+        )
+    )
+
+    # The exact size is normally determined by output resolution. Small neighboring
+    # probes cover resize/re-encode pipelines without turning this into an expensive
+    # arbitrary-scale detector.
+    multipliers = (1.0, 0.97, 1.03, 0.94, 1.06)
+    output: list[float] = []
+    for multiplier in multipliers:
+        candidate = base * multiplier
+        if 0.45 <= candidate <= 2.5 and all(
+            abs(candidate - existing) > 1e-4
+            for existing in output
+        ):
+            output.append(candidate)
+    return output
+
+
 def detect_known_tiled_profile(
     frame: np.ndarray,
 ) -> KnownProfileMatch | None:
     matches: list[KnownProfileMatch] = []
 
     for profile in KNOWN_TILED_PROFILES:
-        match = _match_profile(frame, profile)
-        if match is not None:
-            matches.append(match)
+        for index, scale in enumerate(_profile_scale_candidates(frame, profile)):
+            match = _match_profile_at_scale(
+                frame,
+                profile,
+                scale=scale,
+            )
+            if match is not None:
+                matches.append(match)
+                # Resolution-derived scale is the normal path. Avoid four more
+                # full-frame correlations once it already passes the strict gate.
+                if index == 0:
+                    break
 
     if not matches:
         return None
