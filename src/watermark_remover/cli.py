@@ -32,6 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
     remove.add_argument("--report")
     remove.add_argument("--crf", type=int, default=18)
     remove.add_argument("--preset", default="medium")
+    remove.add_argument(
+        "--fallback",
+        choices=("keep", "inpaint"),
+        default="keep",
+        help=(
+            "handling for uncertain pixels; 'keep' is the safe default, "
+            "'inpaint' is destructive and must be explicitly requested"
+        ),
+    )
     _common_options(remove)
 
     return parser
@@ -59,6 +68,7 @@ def main() -> None:
                 debug_dir=args.debug_dir,
                 crf=args.crf,
                 preset=args.preset,
+                fallback_mode=args.fallback,
             )
 
         if args.report:
