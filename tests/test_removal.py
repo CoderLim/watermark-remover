@@ -3,7 +3,12 @@ import numpy as np
 
 from watermark_remover.detection import detect_repeated_overlay_candidates
 from watermark_remover.estimation import consolidate_repeated_overlay_models
-from watermark_remover.known_profiles import (\n    detect_known_tiled_profile,\n    get_known_profile_alpha,\n)\nfrom watermark_remover.models import OverlayModel, Rect\nfrom watermark_remover.removal import remove_overlay_from_frame
+from watermark_remover.known_profiles import (
+    detect_known_tiled_profile,
+    get_known_profile_alpha,
+)
+from watermark_remover.models import OverlayModel, Rect
+from watermark_remover.removal import remove_overlay_from_frame
 
 
 def test_reverse_alpha_recovers_synthetic_background():
