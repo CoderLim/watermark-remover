@@ -17,6 +17,7 @@ from .estimation import (
     estimate_overlay_model,
     estimate_repeated_overlay_models,
 )
+from .known_profiles import detect_known_tiled_profile
 from .models import OverlayModel
 from .removal import remove_overlay_from_frame
 from .video import encode_processed_video, sample_video_frames
@@ -57,6 +58,8 @@ class WatermarkRemover:
         frames = sample_video_frames(input_path, self.sample_count)
         frame_height, frame_width = frames[0].shape[:2]
 
+        known_profile_report: dict[str, Any] | None = None
+
         if mask_path is not None:
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             if mask is None:
@@ -67,46 +70,74 @@ class WatermarkRemover:
                     (frame_height, frame_width),
                 )
             ]
-            selection_mode = "manual"
-        else:
-            repeated = detect_repeated_overlay_candidates(
-                frames,
-                max_candidates=max(self.max_candidates, 16),
-            )
-            if len(repeated) >= 3:
-                candidates = repeated
-                selection_mode = "spatial-repeat"
-            else:
-                candidates = detect_static_overlay_candidates(
-                    frames,
-                    max_candidates=self.max_candidates,
-                )
-                selection_mode = "temporal-best"
-
-        if not candidates:
-            raise RuntimeError(
-                "no overlay candidate found; provide --mask for a manual region"
-            )
-
-        if selection_mode == "spatial-repeat":
-            # Repeated copies are independent observations of the same visual motif.
-            # Joint consensus is intentionally conservative: unsupported pixels are
-            # removed from the active mask instead of being inpainted.
-            candidate_models = estimate_repeated_overlay_models(
-                frames,
-                candidates,
-            )
-            models = candidate_models
-        else:
             candidate_models = [
-                estimate_overlay_model(frames, candidate)
-                for candidate in candidates
+                estimate_overlay_model(frames, candidates[0])
             ]
-            candidate_models.sort(
-                key=lambda item: item.confidence,
-                reverse=True,
-            )
-            models = [candidate_models[0]]
+            models = candidate_models
+            selection_mode = "manual"
+            candidate_count = len(candidates)
+        else:
+            # Fast path: a calibrated alpha profile is more reliable than trying
+            # to rediscover alpha from a short/static clip. Matching is still
+            # visual/provider-agnostic at runtime: the profile is only applied
+            # when its alpha shape and repetition lattice both correlate strongly.
+            known_match = detect_known_tiled_profile(frames[0])
+
+            if known_match is not None:
+                models = known_match.to_models()
+                candidate_models = models
+                selection_mode = "known-profile"
+                candidate_count = len(models)
+                known_profile_report = {
+                    "profile_id": known_match.profile_id,
+                    "aggregate_score": known_match.aggregate_score,
+                    "median_tile_score": float(
+                        np.median(known_match.tile_scores)
+                    ),
+                    "tile_scores": known_match.tile_scores,
+                    "step_x": known_match.step_x,
+                    "step_y": known_match.step_y,
+                    "profile_scale": known_match.scale,
+                    "confidence": known_match.confidence,
+                }
+            else:
+                repeated = detect_repeated_overlay_candidates(
+                    frames,
+                    max_candidates=max(self.max_candidates, 16),
+                )
+                if len(repeated) >= 3:
+                    candidates = repeated
+                    selection_mode = "spatial-repeat"
+                else:
+                    candidates = detect_static_overlay_candidates(
+                        frames,
+                        max_candidates=self.max_candidates,
+                    )
+                    selection_mode = "temporal-best"
+
+                if not candidates:
+                    raise RuntimeError(
+                        "no overlay candidate found; provide --mask for a manual region"
+                    )
+
+                if selection_mode == "spatial-repeat":
+                    candidate_models = estimate_repeated_overlay_models(
+                        frames,
+                        candidates,
+                    )
+                    models = candidate_models
+                else:
+                    candidate_models = [
+                        estimate_overlay_model(frames, candidate)
+                        for candidate in candidates
+                    ]
+                    candidate_models.sort(
+                        key=lambda item: item.confidence,
+                        reverse=True,
+                    )
+                    models = [candidate_models[0]]
+
+                candidate_count = len(candidates)
 
         report: dict[str, Any] = {
             "input": str(input_path),
@@ -116,12 +147,15 @@ class WatermarkRemover:
             },
             "sample_count": len(frames),
             "selection_mode": selection_mode,
-            "candidate_count": len(candidates),
+            "candidate_count": candidate_count,
             "selected_count": len(models),
             "selected": [model.report() for model in models],
             "candidates": [model.report() for model in candidate_models],
             "safety_policy": "keep-original-on-uncertainty",
         }
+
+        if known_profile_report is not None:
+            report["known_profile"] = known_profile_report
 
         if debug_dir is not None:
             self._write_debug_files(models, Path(debug_dir))
